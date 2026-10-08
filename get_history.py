@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 import time
@@ -5,30 +6,45 @@ from pathlib import Path
 
 import duckdb
 import requests
+from dotenv import load_dotenv
 
-ACCOUNT_IDS = [235303166, 57462604]  # HIER deine echten account_ids (Steam ID3) eintragen!
-DB_PATH = Path("data") / "history.duckdb"
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-COLUMNS = """
-    match_id, start_time, duration_s, match_mode, account_id, team, hero_id,
-    kills, deaths, assists, net_worth, last_hits, denies, player_level, won
-"""
+BASE_DIR = Path(__file__).parent
+load_dotenv(BASE_DIR / ".env")
+
+
+def require(name: str) -> str:
+    """Return a required setting from the environment or exit with an error."""
+    value = os.getenv(name)
+    if not value:
+        sys.exit(f"Missing setting '{name}' in .env")
+    return value
+
+
+ACCOUNT_IDS = [int(x) for x in require("ACCOUNT_IDS").split(",") if x.strip()]
+DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/history.duckdb")
+MANIFEST_URL = os.getenv(
+    "MANIFEST_URL", "https://data.deadlock-api.com/v1/manifest.json"
+)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
+COLUMNS = ", ".join(c.strip() for c in require("COLUMNS").split(",") if c.strip())
 
 
 def fmt(seconds: float) -> str:
+    """Format seconds as mm:ss or h:mm:ss."""
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 def scalar(con: duckdb.DuckDBPyConnection, sql: str) -> int:
+    """Run a query that returns a single integer value."""
     row = con.execute(sql).fetchone()
     assert row is not None
     return int(row[0])
 
 
 class Spinner:
-    """Zeigt während einer blockierenden Abfrage live die Laufzeit an."""
+    """Shows the live elapsed time while a blocking query is running."""
 
     def __init__(self, prefix: str):
         self.prefix = prefix
@@ -54,24 +70,26 @@ class Spinner:
     def __exit__(self, *exc):
         self._stop.set()
         self._thread.join()
+        # Clear the spinner line
         sys.stdout.write("\r" + " " * 100 + "\r")
         sys.stdout.flush()
 
 
 def main() -> None:
-    manifest = requests.get(
-        "https://data.deadlock-api.com/v1/manifest.json", timeout=60
-    ).json()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fetch the manifest and collect the current-generation match_player files
+    manifest = requests.get(MANIFEST_URL, timeout=REQUEST_TIMEOUT).json()
     base = manifest["public_url"].rstrip("/")
     table = manifest["tables"]["match_player"]
     gen = table.get("generation", 0)
-    keys = sorted(
-        f["key"] for f in table["files"] if f.get("generation", 0) == gen
-    )
-    ids = ", ".join(str(int(a)) for a in ACCOUNT_IDS)
+    keys = sorted(f["key"] for f in table["files"] if f.get("generation", 0) == gen)
+    ids = ", ".join(str(a) for a in ACCOUNT_IDS)
 
-    con = duckdb.connect(DB_PATH)
+    con = duckdb.connect(str(DB_PATH))
     con.execute("INSTALL httpfs; LOAD httpfs;")
+
+    # Registry of finished files (also records files with zero matches)
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS processed_files (
@@ -87,10 +105,9 @@ def main() -> None:
     }
     todo = [k for k in keys if k not in done]
 
-    print(f"Account-IDs: {ACCOUNT_IDS}")
-    print(
-        f"Dateien gesamt: {len(keys)} | bereits erledigt: {len(done)} | offen: {len(todo)}\n"
-    )
+    print(f"Database: {DB_PATH}")
+    print(f"Account IDs: {ACCOUNT_IDS}")
+    print(f"Files total: {len(keys)} | already done: {len(done)} | remaining: {len(todo)}\n")
 
     has_matches = bool(
         scalar(
@@ -105,12 +122,13 @@ def main() -> None:
     try:
         for i, key in enumerate(todo, 1):
             short = key.split("match_player/")[-1]
+            # Rough ETA based on the average duration so far
             eta = (
-                f" | Rest ca. {fmt(sum(durations) / len(durations) * (len(todo) - i + 1))}"
+                f" | ETA ~{fmt(sum(durations) / len(durations) * (len(todo) - i + 1))}"
                 if durations
                 else ""
             )
-            prefix = f"[{i}/{len(todo)}] {short} | Treffer: {total_rows}{eta} |"
+            prefix = f"[{i}/{len(todo)}] {short} | Hits: {total_rows}{eta} |"
             query = f"""
                 SELECT {COLUMNS}
                 FROM read_parquet('{base}/{key}')
@@ -118,6 +136,7 @@ def main() -> None:
             """
             start = time.time()
             with Spinner(prefix):
+                # One transaction per file: data and registry entry stay consistent
                 con.execute("BEGIN")
                 if not has_matches:
                     con.execute(f"CREATE TABLE matches AS {query}")
@@ -136,18 +155,19 @@ def main() -> None:
             durations.append(took)
             total_rows += n
             print(
-                f"[{i}/{len(todo)}] OK  {short}  +{n} Zeilen  ({fmt(took)})  gesamt: {total_rows}"
+                f"[{i}/{len(todo)}] OK  {short}  +{n} rows  ({fmt(took)})  total: {total_rows}"
             )
     except KeyboardInterrupt:
         try:
             con.execute("ROLLBACK")
         except duckdb.Error:
             pass
-        print("\nAbgebrochen. Beim nächsten Start geht es bei der offenen Datei weiter.")
+        print("\nAborted. The next run resumes with the unfinished file.")
         sys.exit(130)
 
-    print(f"\nFertig in {fmt(time.time() - t0)}. Zeilen in 'matches': {total_rows}")
+    print(f"\nDone in {fmt(time.time() - t0)}. Rows in 'matches': {total_rows}")
     if has_matches:
+        # Base, delta and residual files may overlap, so check for duplicates
         dups = scalar(
             con,
             """
@@ -157,7 +177,7 @@ def main() -> None:
             )
             """,
         )
-        print(f"Doppelte (match_id, account_id)-Paare: {dups}")
+        print(f"Duplicate (match_id, account_id) pairs: {dups}")
     con.close()
 
 
