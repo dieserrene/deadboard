@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# Tools
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Datenbanken und Daten
+data/
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Umgebungsvariablen
+.env
+
+# Editoren
+.idea/
+.vscode/
