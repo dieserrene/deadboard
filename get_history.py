@@ -21,10 +21,14 @@ def require(name: str) -> str:
 
 
 ACCOUNT_IDS = [
-    int(value.strip())
-    for value in require("ACCOUNT_IDS").replace(",", "\n").splitlines()
-    if value.strip()
+    int(line.split("#", 1)[0].strip())
+    for line in require("ACCOUNT_IDS").replace(",", "\n").splitlines()
+    if line.split("#", 1)[0].strip()
 ]
+DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/history.duckdb")
+MANIFEST_URL = os.getenv(
+    "MANIFEST_URL", "https://data.deadlock-api.com/v1/manifest.json"
+)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
 COLUMNS = ", ".join(c.strip() for c in require("COLUMNS").split(",") if c.strip())
 
